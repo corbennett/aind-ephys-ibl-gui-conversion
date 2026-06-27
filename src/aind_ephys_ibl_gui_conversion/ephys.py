@@ -236,10 +236,13 @@ def extract_continuous(
 
     # --- Assemble per stream ---
     for stream in streams:
-        results = sorted(
-            [r for s, r in all_results if s is stream],
-            key=lambda r: r.block.block_index,
-        )
+        # Build a lookup from block identity to result
+        block_results = {
+            id(r.block): r for s, r in all_results if s is stream
+        }
+        # Preserve stream.blocks ordering (main first, surface second)
+        # to stay consistent with _save_channel_metadata
+        results = [block_results[id(b)] for b in stream.blocks]
 
         _assemble_and_save_stream(
             stream,
