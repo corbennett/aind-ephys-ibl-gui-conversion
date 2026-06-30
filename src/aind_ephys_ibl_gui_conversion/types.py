@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +16,14 @@ class ExperimentBlock:
     recording: si.BaseRecording
     lfp_recording: si.BaseRecording | None  # 1.0 probes only
     block_index: int
+    contact_ids: np.ndarray = field(default=None)  # type: ignore[assignment]
+
+    def __post_init__(self):
+        """Default contact_ids to sequential indices if not provided."""
+        if self.contact_ids is None:
+            self.contact_ids = np.arange(
+                self.recording.get_num_channels()
+            )
 
     @property
     def is_1_0(self) -> bool:

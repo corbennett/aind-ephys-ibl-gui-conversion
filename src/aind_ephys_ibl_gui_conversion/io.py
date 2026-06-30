@@ -81,7 +81,7 @@ def load_probe_streams(
                 )
 
     def _load_one(item):
-        """Load one zarr recording's metadata."""
+        """Load one zarr recording's metadata and contact_ids."""
         stream_name, block_index, is_lfp = item
         if is_lfp:
             lfp_stream_name = stream_name.replace("AP", "LFP")
@@ -95,20 +95,40 @@ def load_probe_streams(
                 / f"experiment{block_index + 1}_{stream_name}.zarr"
             )
         if is_lfp and not zarr_path.exists():
-            return item, None
+            return item, None, None
         try:
             rec = si.read_zarr(zarr_path)
         except Exception:
             logging.exception(f"[FFT] Failed to load zarr: {zarr_path}")
             raise
         rec.reset_times()
-        return item, rec
+
+        # Read contact_ids directly from zarr .zattrs
+        contact_ids = None
+        if not is_lfp:
+            zattrs_path = zarr_path / ".zattrs"
+            if zattrs_path.exists():
+                zattrs = json.loads(zattrs_path.read_text())
+                raw_ids = (
+                    zattrs.get("probe", {})
+                    .get("probes", [{}])[0]
+                    .get("contact_ids", [])
+                )
+                if raw_ids:
+                    contact_ids = np.array(
+                        [int(cid.lstrip("e")) for cid in raw_ids]
+                    )
+
+        return item, rec, contact_ids
 
     # Load all zarr metadata in parallel
     loaded = {}
+    contact_ids_map = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for item, rec in pool.map(_load_one, load_items):
+        for item, rec, contact_ids in pool.map(_load_one, load_items):
             loaded[item] = rec
+            if contact_ids is not None:
+                contact_ids_map[item] = contact_ids
 
     # Build ProbeStream objects
     results_folder = Path(results_folder)
@@ -140,11 +160,19 @@ def load_probe_streams(
                         f"{lfp_rec.get_num_channels()} channels"
                     )
 
+            # Use contact_ids from zarr; fall back to sequential
+            cids = contact_ids_map.get(
+                (stream_name, block_index, False)
+            )
+            if cids is None:
+                cids = np.arange(rec.get_num_channels())
+
             blocks.append(
                 ExperimentBlock(
                     recording=rec,
                     lfp_recording=lfp_rec,
                     block_index=block_index,
+                    contact_ids=cids,
                 )
             )
 
@@ -326,20 +354,25 @@ def _save_method_metadata(
 
 def _save_channel_metadata(
     output_folder: Path,
-    recordings: list[si.BaseRecording],
+    blocks: list[ExperimentBlock],
 ) -> None:
     """Save deduplicated channel locations and indices.
 
-    When blocks have overlapping channels (same physical position),
-    only one copy of each unique (x, y) location is saved.
+    Uses contact_ids for deduplication and (x, y) positions for
+    output ordering (by depth then lateral position).
     """
+    all_ids = np.concatenate([b.contact_ids for b in blocks])
     all_locs = np.concatenate(
-        [r.get_channel_locations() for r in recordings], axis=0
+        [b.recording.get_channel_locations() for b in blocks], axis=0
     )
-    # Deduplicate, preserving first-occurrence order
-    _, unique_idx = np.unique(all_locs, axis=0, return_index=True)
-    unique_idx = np.sort(unique_idx)
-    unique_locs = all_locs[unique_idx]
+
+    # Deduplicate by contact_id
+    _, first_idx = np.unique(all_ids, return_index=True)
+    unique_locs = all_locs[first_idx]
+
+    # Order by depth (y), then lateral position (x)
+    output_order = np.lexsort((unique_locs[:, 0], unique_locs[:, 1]))
+    unique_locs = unique_locs[output_order]
 
     np.save(output_folder / "channels.localCoordinates.npy", unique_locs)
     np.save(
@@ -383,10 +416,7 @@ def _assemble_and_save_stream(
         # Combined: probe summary RMS + coherence + channel metadata
         _save_combined_rms_summary(output_folder, results)
         _save_spectral_outputs(output_folder, results)
-        _save_channel_metadata(
-            output_folder,
-            [b.recording for b in stream.blocks],
-        )
+        _save_channel_metadata(output_folder, stream.blocks)
 
         # Main: full RMS time series (only main block channels)
         _save_rms(output_folder, main_result, tag="Main")
@@ -394,7 +424,7 @@ def _assemble_and_save_stream(
         # No surface: single block, save everything
         _save_rms(output_folder, main_result, tag="")
         _save_spectral_outputs(output_folder, [main_result])
-        _save_channel_metadata(output_folder, [main_result.block.recording])
+        _save_channel_metadata(output_folder, [main_result.block])
 
     _save_method_metadata(
         output_folder,
@@ -469,9 +499,4 @@ def process_stream_fft(
             )
 
     if save_channel_metadata:
-        locs = block.recording.get_channel_locations()
-        np.save(output_folder / "channels.localCoordinates.npy", locs)
-        np.save(
-            output_folder / "channels.rawInd.npy",
-            np.arange(locs.shape[0]),
-        )
+        _save_channel_metadata(output_folder, [block])
