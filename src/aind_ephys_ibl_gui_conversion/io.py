@@ -15,6 +15,7 @@ from aind_ephys_ibl_gui_conversion.metrics import (
 )
 from aind_ephys_ibl_gui_conversion.recording_utils import (
     _stream_to_probe_name,
+    get_largest_segment_recordings,
 )
 from aind_ephys_ibl_gui_conversion.types import (
     BlockMetrics,
@@ -101,6 +102,16 @@ def load_probe_streams(
         except Exception:
             logging.exception(f"[FFT] Failed to load zarr: {zarr_path}")
             raise
+        # Multi-segment recordings (e.g. an experiment with multiple
+        # acquisition starts/stops) must be reduced to a single segment
+        # before any segment-agnostic call like get_duration(). For
+        # alignment we keep the largest segment.
+        if rec.get_num_segments() > 1:
+            (rec,) = get_largest_segment_recordings([rec])
+            logging.info(
+                f"[FFT] Multi-segment recording {zarr_path.name} "
+                "reduced to largest segment"
+            )
         rec.reset_times()
         return item, rec
 
