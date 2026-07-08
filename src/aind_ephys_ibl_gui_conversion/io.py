@@ -4,6 +4,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import spikeinterface as si
@@ -25,6 +26,200 @@ from aind_ephys_ibl_gui_conversion.types import (
 # ---------------------------------------------------------------------------
 # Recording loading
 # ---------------------------------------------------------------------------
+
+_LoadItem = tuple[str, int, bool]
+_LoadedItem = tuple[_LoadItem, si.BaseRecording | None, np.ndarray | None]
+
+
+def _filter_ap_streams(
+    neuropix_streams: list[str],
+    stream_to_use: str | None,
+) -> list[str]:
+    """Return streams that should be loaded as AP/wideband recordings."""
+    return [
+        stream
+        for stream in neuropix_streams
+        if "LFP" not in stream
+        and (stream_to_use is None or stream == stream_to_use)
+    ]
+
+
+def _build_load_items(
+    ap_streams: list[str],
+    num_blocks: int,
+) -> list[_LoadItem]:
+    """Build AP/wideband and optional LFP load requests."""
+    load_items: list[_LoadItem] = []
+    for stream_name in ap_streams:
+        is_1_0 = "AP" in stream_name
+        for block_index in range(num_blocks):
+            load_items.append((stream_name, block_index, False))
+            if is_1_0:
+                load_items.append((stream_name, block_index, True))
+    return load_items
+
+
+def _zarr_path_for_item(
+    ecephys_compressed_folder: Path,
+    item: _LoadItem,
+) -> Path:
+    """Return the zarr path for one load request."""
+    stream_name, block_index, is_lfp = item
+    if is_lfp:
+        stream_name = stream_name.replace("AP", "LFP")
+    return (
+        ecephys_compressed_folder
+        / f"experiment{block_index + 1}_{stream_name}.zarr"
+    )
+
+
+def _read_contact_ids(zarr_path: Path) -> np.ndarray | None:
+    """Read probe contact IDs directly from zarr metadata."""
+    zattrs_path = zarr_path / ".zattrs"
+    if not zattrs_path.exists():
+        return None
+
+    zattrs = json.loads(zattrs_path.read_text())
+    raw_ids = (
+        zattrs.get("probe", {}).get("probes", [{}])[0].get("contact_ids", [])
+    )
+    if not raw_ids:
+        return None
+
+    return np.array([int(cid.lstrip("e")) for cid in raw_ids])
+
+
+def _load_one_recording(
+    ecephys_compressed_folder: Path,
+    item: _LoadItem,
+) -> _LoadedItem:
+    """Load one zarr recording's metadata and contact IDs."""
+    _, _, is_lfp = item
+    zarr_path = _zarr_path_for_item(ecephys_compressed_folder, item)
+    if is_lfp and not zarr_path.exists():
+        return item, None, None
+
+    try:
+        rec = si.read_zarr(zarr_path)
+    except Exception:
+        logging.exception(f"[FFT] Failed to load zarr: {zarr_path}")
+        raise
+    rec.reset_times()
+
+    contact_ids = None if is_lfp else _read_contact_ids(zarr_path)
+    return item, rec, contact_ids
+
+
+def _load_zarr_metadata(
+    load_items: list[_LoadItem],
+    ecephys_compressed_folder: Path,
+) -> tuple[
+    dict[_LoadItem, si.BaseRecording | None],
+    dict[_LoadItem, np.ndarray],
+]:
+    """Load all requested zarr metadata in parallel."""
+    loaded = {}
+    contact_ids_map = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        args = [ecephys_compressed_folder] * len(load_items)
+        for item, rec, contact_ids in pool.map(
+            _load_one_recording,
+            args,
+            load_items,
+        ):
+            loaded[item] = rec
+            if contact_ids is not None:
+                contact_ids_map[item] = contact_ids
+    return loaded, contact_ids_map
+
+
+def _log_loaded_recording(
+    stream_name: str,
+    block_index: int,
+    rec: si.BaseRecording,
+) -> None:
+    """Log AP/wideband recording metadata."""
+    logging.info(
+        f"[FFT] Loaded stream {stream_name} "
+        f"block {block_index}: "
+        f"{rec.get_duration():.1f}s, "
+        f"{rec.get_num_channels()} channels"
+    )
+
+
+def _log_loaded_lfp_recording(
+    stream_name: str,
+    block_index: int,
+    lfp_rec: si.BaseRecording,
+) -> None:
+    """Log LFP recording metadata."""
+    logging.info(
+        f"[FFT] Loaded 1.0 LFP stream "
+        f"{stream_name.replace('AP', 'LFP')} "
+        f"block {block_index}: "
+        f"{lfp_rec.get_sampling_frequency():.0f} Hz, "
+        f"{lfp_rec.get_num_channels()} channels"
+    )
+
+
+def _build_experiment_block(
+    stream_name: str,
+    block_index: int,
+    is_1_0: bool,
+    loaded: dict[_LoadItem, si.BaseRecording | None],
+    contact_ids_map: dict[_LoadItem, np.ndarray],
+) -> ExperimentBlock:
+    """Build one ExperimentBlock from loaded recordings."""
+    ap_item = (stream_name, block_index, False)
+    rec = cast(si.BaseRecording, loaded[ap_item])
+
+    _log_loaded_recording(stream_name, block_index, rec)
+
+    lfp_rec = None
+    if is_1_0:
+        lfp_rec = loaded.get((stream_name, block_index, True))
+        if lfp_rec is not None:
+            _log_loaded_lfp_recording(stream_name, block_index, lfp_rec)
+
+    contact_ids = contact_ids_map.get(ap_item)
+    if contact_ids is None:
+        contact_ids = np.arange(rec.get_num_channels())
+
+    return ExperimentBlock(
+        recording=rec,
+        lfp_recording=lfp_rec,
+        block_index=block_index,
+        contact_ids=contact_ids,
+    )
+
+
+def _build_probe_stream(
+    stream_name: str,
+    num_blocks: int,
+    results_folder: Path,
+    loaded: dict[_LoadItem, si.BaseRecording | None],
+    contact_ids_map: dict[_LoadItem, np.ndarray],
+) -> ProbeStream:
+    """Build one ProbeStream from loaded block recordings."""
+    is_1_0 = "AP" in stream_name
+    probe_name = _stream_to_probe_name(stream_name)
+    blocks = [
+        _build_experiment_block(
+            stream_name,
+            block_index,
+            is_1_0,
+            loaded,
+            contact_ids_map,
+        )
+        for block_index in range(num_blocks)
+    ]
+
+    return ProbeStream(
+        stream_name=stream_name,
+        probe_name=probe_name,
+        blocks=blocks,
+        output_folder=results_folder / probe_name,
+    )
 
 
 def load_probe_streams(
@@ -60,130 +255,23 @@ def load_probe_streams(
     list[ProbeStream]
         One ProbeStream per stream, each containing ExperimentBlocks.
     """
-    # Filter to streams we care about
-    ap_streams = [
-        s
-        for s in neuropix_streams
-        if "LFP" not in s and (stream_to_use is None or s == stream_to_use)
-    ]
-
-    # Build list of all zarr paths to load in parallel
-    load_items = []
-    for stream_name in ap_streams:
-        is_1_0 = "AP" in stream_name
-        for block_index in range(num_blocks):
-            load_items.append(
-                (stream_name, block_index, False)  # AP/wideband
-            )
-            if is_1_0:
-                load_items.append(
-                    (stream_name, block_index, True)  # LFP
-                )
-
-    def _load_one(item):
-        """Load one zarr recording's metadata and contact_ids."""
-        stream_name, block_index, is_lfp = item
-        if is_lfp:
-            lfp_stream_name = stream_name.replace("AP", "LFP")
-            zarr_path = (
-                ecephys_compressed_folder
-                / f"experiment{block_index + 1}_{lfp_stream_name}.zarr"
-            )
-        else:
-            zarr_path = (
-                ecephys_compressed_folder
-                / f"experiment{block_index + 1}_{stream_name}.zarr"
-            )
-        if is_lfp and not zarr_path.exists():
-            return item, None, None
-        try:
-            rec = si.read_zarr(zarr_path)
-        except Exception:
-            logging.exception(f"[FFT] Failed to load zarr: {zarr_path}")
-            raise
-        rec.reset_times()
-
-        # Read contact_ids directly from zarr .zattrs
-        contact_ids = None
-        if not is_lfp:
-            zattrs_path = zarr_path / ".zattrs"
-            if zattrs_path.exists():
-                zattrs = json.loads(zattrs_path.read_text())
-                raw_ids = (
-                    zattrs.get("probe", {})
-                    .get("probes", [{}])[0]
-                    .get("contact_ids", [])
-                )
-                if raw_ids:
-                    contact_ids = np.array(
-                        [int(cid.lstrip("e")) for cid in raw_ids]
-                    )
-
-        return item, rec, contact_ids
-
-    # Load all zarr metadata in parallel
-    loaded = {}
-    contact_ids_map = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        for item, rec, contact_ids in pool.map(_load_one, load_items):
-            loaded[item] = rec
-            if contact_ids is not None:
-                contact_ids_map[item] = contact_ids
-
-    # Build ProbeStream objects
+    ap_streams = _filter_ap_streams(neuropix_streams, stream_to_use)
+    load_items = _build_load_items(ap_streams, num_blocks)
+    loaded, contact_ids_map = _load_zarr_metadata(
+        load_items,
+        ecephys_compressed_folder,
+    )
     results_folder = Path(results_folder)
-    probe_streams: list[ProbeStream] = []
-
-    for stream_name in ap_streams:
-        is_1_0 = "AP" in stream_name
-        probe_name = _stream_to_probe_name(stream_name)
-        blocks: list[ExperimentBlock] = []
-
-        for block_index in range(num_blocks):
-            rec = loaded[(stream_name, block_index, False)]
-            logging.info(
-                f"[FFT] Loaded stream {stream_name} "
-                f"block {block_index}: "
-                f"{rec.get_duration():.1f}s, "
-                f"{rec.get_num_channels()} channels"
-            )
-
-            lfp_rec = None
-            if is_1_0:
-                lfp_rec = loaded.get((stream_name, block_index, True))
-                if lfp_rec is not None:
-                    logging.info(
-                        f"[FFT] Loaded 1.0 LFP stream "
-                        f"{stream_name.replace('AP', 'LFP')} "
-                        f"block {block_index}: "
-                        f"{lfp_rec.get_sampling_frequency():.0f} Hz, "
-                        f"{lfp_rec.get_num_channels()} channels"
-                    )
-
-            # Use contact_ids from zarr; fall back to sequential
-            cids = contact_ids_map.get((stream_name, block_index, False))
-            if cids is None:
-                cids = np.arange(rec.get_num_channels())
-
-            blocks.append(
-                ExperimentBlock(
-                    recording=rec,
-                    lfp_recording=lfp_rec,
-                    block_index=block_index,
-                    contact_ids=cids,
-                )
-            )
-
-        probe_streams.append(
-            ProbeStream(
-                stream_name=stream_name,
-                probe_name=probe_name,
-                blocks=blocks,
-                output_folder=results_folder / probe_name,
-            )
+    return [
+        _build_probe_stream(
+            stream_name,
+            num_blocks,
+            results_folder,
+            loaded,
+            contact_ids_map,
         )
-
-    return probe_streams
+        for stream_name in ap_streams
+    ]
 
 
 # ---------------------------------------------------------------------------
