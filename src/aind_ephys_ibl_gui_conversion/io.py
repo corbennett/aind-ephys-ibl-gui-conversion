@@ -161,9 +161,7 @@ def load_probe_streams(
                     )
 
             # Use contact_ids from zarr; fall back to sequential
-            cids = contact_ids_map.get(
-                (stream_name, block_index, False)
-            )
+            cids = contact_ids_map.get((stream_name, block_index, False))
             if cids is None:
                 cids = np.arange(rec.get_num_channels())
 
