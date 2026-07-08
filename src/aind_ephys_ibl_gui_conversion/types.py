@@ -16,7 +16,7 @@ class ExperimentBlock:
     recording: si.BaseRecording
     lfp_recording: si.BaseRecording | None  # 1.0 probes only
     block_index: int
-    contact_ids: np.ndarray = field(default=None)  # type: ignore[assignment]
+    contact_ids: np.ndarray | None = field(default=None)
 
     def __post_init__(self):
         """Default contact_ids to sequential indices if not provided."""
