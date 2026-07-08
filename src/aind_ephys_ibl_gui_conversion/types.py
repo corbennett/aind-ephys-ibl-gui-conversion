@@ -21,9 +21,7 @@ class ExperimentBlock:
     def __post_init__(self):
         """Default contact_ids to sequential indices if not provided."""
         if self.contact_ids is None:
-            self.contact_ids = np.arange(
-                self.recording.get_num_channels()
-            )
+            self.contact_ids = np.arange(self.recording.get_num_channels())
 
     @property
     def is_1_0(self) -> bool:
