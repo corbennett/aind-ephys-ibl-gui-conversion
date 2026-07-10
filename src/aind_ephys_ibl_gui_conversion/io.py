@@ -16,6 +16,7 @@ from aind_ephys_ibl_gui_conversion.metrics import (
 )
 from aind_ephys_ibl_gui_conversion.recording_utils import (
     _stream_to_probe_name,
+    get_largest_segment_recordings,
 )
 from aind_ephys_ibl_gui_conversion.types import (
     BlockMetrics,
@@ -261,6 +262,67 @@ def load_probe_streams(
         load_items,
         ecephys_compressed_folder,
     )
+    # Filter to streams we care about
+    ap_streams = [
+        s
+        for s in neuropix_streams
+        if "LFP" not in s and (stream_to_use is None or s == stream_to_use)
+    ]
+
+    # Build list of all zarr paths to load in parallel
+    load_items = []
+    for stream_name in ap_streams:
+        is_1_0 = "AP" in stream_name
+        for block_index in range(num_blocks):
+            load_items.append(
+                (stream_name, block_index, False)  # AP/wideband
+            )
+            if is_1_0:
+                load_items.append(
+                    (stream_name, block_index, True)  # LFP
+                )
+
+    def _load_one(item):
+        """Load one zarr recording's metadata."""
+        stream_name, block_index, is_lfp = item
+        if is_lfp:
+            lfp_stream_name = stream_name.replace("AP", "LFP")
+            zarr_path = (
+                ecephys_compressed_folder
+                / f"experiment{block_index + 1}_{lfp_stream_name}.zarr"
+            )
+        else:
+            zarr_path = (
+                ecephys_compressed_folder
+                / f"experiment{block_index + 1}_{stream_name}.zarr"
+            )
+        if is_lfp and not zarr_path.exists():
+            return item, None
+        try:
+            rec = si.read_zarr(zarr_path)
+        except Exception:
+            logging.exception(f"[FFT] Failed to load zarr: {zarr_path}")
+            raise
+        # Multi-segment recordings (e.g. an experiment with multiple
+        # acquisition starts/stops) must be reduced to a single segment
+        # before any segment-agnostic call like get_duration(). For
+        # alignment we keep the largest segment.
+        if rec.get_num_segments() > 1:
+            (rec,) = get_largest_segment_recordings([rec])
+            logging.info(
+                f"[FFT] Multi-segment recording {zarr_path.name} "
+                "reduced to largest segment"
+            )
+        rec.reset_times()
+        return item, rec
+
+    # Load all zarr metadata in parallel
+    loaded = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for item, rec in pool.map(_load_one, load_items):
+            loaded[item] = rec
+
+    # Build ProbeStream objects
     results_folder = Path(results_folder)
     return [
         _build_probe_stream(

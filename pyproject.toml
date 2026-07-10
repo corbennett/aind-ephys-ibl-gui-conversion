@@ -17,7 +17,7 @@ authors = [
 ]
 classifiers = ["Programming Language :: Python :: 3"]
 readme = "README.md"
-version = "0.3.1"
+version = "0.3.2"
 
 dependencies = [
     "aind-mri-utils",
