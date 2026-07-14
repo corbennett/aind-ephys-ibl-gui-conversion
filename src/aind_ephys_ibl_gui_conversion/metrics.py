@@ -396,43 +396,37 @@ def _build_channel_maps(
 ) -> tuple[np.ndarray, list[np.ndarray], int]:
     """Build channel index maps for combining blocks with overlapping channels.
 
-    Uses contact_ids for deduplication (exact integer match) and
-    (x, y) positions for output ordering (by depth then lateral).
-
     Returns
     -------
     unique_locs : np.ndarray
-        Unique channel locations, shape ``(n_unique, 2)``,
-        ordered by depth (y) then lateral position (x).
+        Unique channel locations, shape ``(n_unique, 2)``.
     block_channel_maps : list[np.ndarray]
         Per-block arrays mapping each block channel to its index in
         ``unique_locs``.
     total_n_channels : int
         Number of unique channels.
     """
-    all_ids = np.concatenate([r.block.contact_ids for r in results])
-    all_locs = np.concatenate(
-        [r.block.recording.get_channel_locations() for r in results],
-        axis=0,
-    )
+    all_locs = []
+    for r in results:
+        all_locs.append(r.block.recording.get_channel_locations())
+    concat_locs = np.concatenate(all_locs, axis=0)
 
-    # Deduplicate by contact_id (exact integer match)
-    unique_ids, first_idx = np.unique(all_ids, return_index=True)
-    unique_locs = all_locs[first_idx]
+    _, unique_idx = np.unique(concat_locs, axis=0, return_index=True)
+    unique_idx = np.sort(unique_idx)
+    unique_locs = concat_locs[unique_idx]
+    total_n_channels = len(unique_locs)
 
-    # Order by depth (y), then lateral position (x) for ties
-    output_order = np.lexsort((unique_locs[:, 0], unique_locs[:, 1]))
-    unique_ids_ordered = unique_ids[output_order]
-    unique_locs_ordered = unique_locs[output_order]
+    block_channel_maps = []
+    for locs in all_locs:
+        ch_map = np.empty(len(locs), dtype=int)
+        for i, loc in enumerate(locs):
+            matches = np.where(
+                np.all(np.abs(unique_locs - loc) < 1e-6, axis=1)
+            )[0]
+            ch_map[i] = matches[0] if len(matches) > 0 else i
+        block_channel_maps.append(ch_map)
 
-    # Map each block's channels to the depth-ordered output
-    id_to_idx = {int(eid): i for i, eid in enumerate(unique_ids_ordered)}
-    block_channel_maps = [
-        np.array([id_to_idx[int(eid)] for eid in r.block.contact_ids])
-        for r in results
-    ]
-
-    return unique_locs_ordered, block_channel_maps, len(unique_ids_ordered)
+    return unique_locs, block_channel_maps, total_n_channels
 
 
 def _build_shank_channel_maps(
@@ -576,7 +570,6 @@ def _assemble_blockwise_coherence(
     channel_blocks_meta = []
     for block_idx, (r, ch_map) in enumerate(zip(results, block_channel_maps)):
         rec = r.block.recording
-        cids = r.block.contact_ids
         label = (
             "main"
             if rec.get_duration() >= main_recording_min_secs
@@ -586,7 +579,6 @@ def _assemble_blockwise_coherence(
             {
                 "block_index": block_idx,
                 "channel_indices": ch_map.tolist(),
-                "contact_id_range": [int(cids.min()), int(cids.max())],
                 "label": label,
                 "n_channels": rec.get_num_channels(),
                 "duration_s": float(rec.get_duration()),
